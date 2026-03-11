@@ -9,6 +9,8 @@
 
 repeat task.wait() until game:IsLoaded()
 
+-- Error reporter: prints REAL error location (AC bypass fakes line numbers)
+local function _aethel_run()
 
 -- ================================================================
 -- SECTION 1 — SERVICES & GLOBALS
@@ -70,10 +72,11 @@ do
 
     pcall(function()
         if typeof(hookfunction) ~= "function" or typeof(debug) ~= "table" then return end
+        if not debug.info or typeof(debug.info) ~= "function" then return end
         local orig_debug_info = debug.info
         safeHook(debug.info, function(level, flags)
             if level == 2 and flags == "s" then return "LocalScript" end
-            return orig_debug_info(level, flags)
+            if orig_debug_info then return orig_debug_info(level, flags) end
         end)
     end)
 
@@ -1469,8 +1472,12 @@ local function handleKickerGui(child)
     end)
 end
 
-Player:WaitForChild("PlayerGui", 10).ChildAdded:Connect(function(child)
-    if kickerAutoEnabled then handleKickerGui(child) end
+task.spawn(function()
+    local _kpg = Player:WaitForChild("PlayerGui", 15) or Player:FindFirstChild("PlayerGui")
+    if not _kpg then return end
+    _kpg.ChildAdded:Connect(function(child)
+        if kickerAutoEnabled then handleKickerGui(child) end
+    end)
 end)
 
 -- ================================================================
@@ -2264,4 +2271,10 @@ AddSlider(tfMisc, "Pull Radius", 1, 25, 5, 1, function(v) pullvectordistance = v
 -- ================================================================
 switchTab("Catching")
 
-print("Aethel Hub v26d | firetouchinterest fully removed · CFrame-only mags+tackle · zero CrossExperience spam")
+print("Aethel Hub v26d | loaded OK")
+
+end -- _aethel_run
+local _ok, _err = pcall(_aethel_run)
+if not _ok then
+    warn("[Aethel Hub] LOAD ERROR: " .. tostring(_err))
+end
