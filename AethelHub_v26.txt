@@ -24,17 +24,10 @@ local VIM = (function()
     return ok and svc or nil
 end)()
 
--- Probe VIM methods with a REAL call — typeof() lies on some executors.
--- A failing call generates one CrossExperience log entry but prevents
--- the hundreds that would follow from the Heartbeat loops.
-local VIM_hasTouch = false
-local VIM_hasMouse = false
-if VIM then
-    local _dp = Instance.new("Part"); _dp.Parent = nil
-    VIM_hasTouch  = pcall(function() VIM:SendTouchEvent(0, Enum.UserInputState.Cancel.Value, 0, 0) end)
-    VIM_hasMouse  = pcall(function() VIM:SendMouseButtonEvent(0, 0, 0, false, game, 0) end)
-    pcall(function() _dp:Destroy() end)
-end
+-- Detect VIM capabilities without actually calling them (avoids CrossExperience spam)
+local UserInputService_probe = game:GetService("UserInputService")
+local VIM_hasTouch = VIM ~= nil and UserInputService_probe.TouchEnabled
+local VIM_hasMouse = VIM ~= nil and not UserInputService_probe.TouchEnabled
 
 -- firetouchinterest is NOT used anywhere in this script.
 -- On mobile executors every engine-level FTI call logs a CrossExperience
@@ -111,7 +104,8 @@ do
         local remote  = remotes and remotes:FindFirstChild("CharacterSoundEvent")
         if not remote or typeof(hookfunction) ~= "function" then return end
         local oldFire = remote.FireServer
-        hookfunction(remote.FireServer, newcclosure(function(self, ...)
+        local _nc = newcclosure or function(f) return f end
+        hookfunction(remote.FireServer, _nc(function(self, ...)
             local args = {...}
             if type(args[1]) == "string" and #args[1] > 20 then
                 if args[2] == "b51b07a5c14d" or args[2] == "error" then return end
@@ -590,7 +584,7 @@ end)
 -- ── HUD GUI ───────────────────────────────────────────────────────
 local qb_gui = Instance.new("ScreenGui")
 qb_gui.Name           = "QBACards"
-qb_gui.Parent         = Player:WaitForChild("PlayerGui", 10) or Player:FindFirstChild("PlayerGui")
+qb_gui.Parent         = Player:WaitForChild("PlayerGui", 10)
 qb_gui.ResetOnSpawn   = false
 qb_gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 qb_gui.Enabled        = false
@@ -723,7 +717,7 @@ if qb_isMobile then
     qb_mobileGui.IgnoreGuiInset = true
     qb_mobileGui.DisplayOrder   = 20
     qb_mobileGui.Enabled        = false
-    qb_mobileGui.Parent         = Player:WaitForChild("PlayerGui", 10) or Player:FindFirstChild("PlayerGui")
+    qb_mobileGui.Parent         = Player:WaitForChild("PlayerGui", 10)
 
     local PILL_W, PILL_H = 110, 44
     local function makePill(name, offY, icon, labelTxt, bgColor)
@@ -1641,14 +1635,8 @@ end)
 -- SECTION 8 — CUSTOM UI
 -- ================================================================
 local _pg = Player:WaitForChild("PlayerGui", 15) or Player:FindFirstChild("PlayerGui")
-if not _pg then
-    -- Last resort: spin until we have it
-    local t0 = tick()
-    repeat task.wait(0.1) until Player:FindFirstChild("PlayerGui") or tick()-t0 > 20
-    _pg = Player:FindFirstChild("PlayerGui")
-end
 if _pg and _pg:FindFirstChild("AethelHubUI") then _pg.AethelHubUI:Destroy() end
-if not _pg then return end -- can't build UI without PlayerGui
+if not _pg then return end
 
 -- ── Colors ────────────────────────────────────────────────────────
 local C_BG        = Color3.fromRGB(10, 10, 20)
