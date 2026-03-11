@@ -13,6 +13,13 @@ local LP        = Players.LocalPlayer
 local PGui      = LP:WaitForChild("PlayerGui", 15) or LP:FindFirstChild("PlayerGui")
 local isMobile  = UIS.TouchEnabled and not UIS.KeyboardEnabled
 
+if not PGui then
+    -- Last resort spin
+    local t0 = tick()
+    repeat task.wait(0.1) until LP:FindFirstChild("PlayerGui") or tick()-t0 > 20
+    PGui = LP:FindFirstChild("PlayerGui")
+end
+if not PGui then return end  -- can't run without PlayerGui
 if PGui:FindFirstChild("AethelHub2") then PGui.AethelHub2:Destroy() end
 if PGui:FindFirstChild("AethelGreenFloat") then PGui.AethelGreenFloat:Destroy() end
 
@@ -627,7 +634,9 @@ local function setupAutoShoot()
             task.wait(ms/1000)
             if shooting then
                 autoReleasing=true
+                startBarLoop()
                 pcall(function() if VIM then VIM:SendKeyEvent(false,Enum.KeyCode.E,false,game) end end)
+                task.wait(0.08); stopBarLoop()
                 SOStatus.Text="Released! ("..ms.."ms)"; SOStatus.TextColor3=Color3.fromRGB(80,255,120)
                 task.wait(0.8); autoReleasing=false; shooting=false
                 SOStatus.Text="Ready - hold E to shoot"; SOStatus.TextColor3=Color3.fromRGB(160,155,210)
@@ -714,7 +723,9 @@ local function setupAutoDunk()
             dunkStatusLbl.Text="Charging "..ms.."ms"; dunkStatusLbl.TextColor3=Color3.fromRGB(255,200,80)
             task.wait(ms/1000)
             if dunkShooting then
+                startBarLoop()
                 pcall(function() if VIM then VIM:SendKeyEvent(false,Enum.KeyCode.Space,false,game) end end)
+                task.wait(0.08); stopBarLoop()
                 dunkStatusLbl.Text="Released!"; dunkStatusLbl.TextColor3=Color3.fromRGB(80,255,120)
                 task.wait(0.8); dunkShooting=false; dunkStatusLbl.Text="Hold Space to dunk"; dunkStatusLbl.TextColor3=Color3.fromRGB(160,155,210)
             end
@@ -755,7 +766,7 @@ CreateSection(moveScroll,"Movement")
 local stealRunning2=false
 local function setupAutoSteal()
     if stealRunning2 then return end; stealRunning2=true
-    local VIM2=game:GetService("VirtualInputManager")
+    local VIM2=(function() local ok,s=pcall(function() return game:GetService("VirtualInputManager") end); return ok and s or nil end)()
     task.spawn(function()
         while stealRunning2 do
             task.wait(0.35)
