@@ -144,40 +144,31 @@ local function beamProjectile(g, v0, x0, t1)
 end
 
 -- ================================================================
--- SECTION 4 — QB AIMBOT (v26: physics lead, accel prediction, auto-throw)
+-- SECTION 4 — QB AIMBOT (v26d: simplified prediction + lead slider)
 -- ================================================================
 
--- ── Constants ─────────────────────────────────────────────────────
-local G = 19.6  -- FF2 ball gravity constant (studs/s²)
-
--- ── Config ────────────────────────────────────────────────────────
+-- ── Config (referenced by UI tab) ────────────────────────────────
 local qbEnabled          = false
-local qb_autoAngle       = false
+local qb_autoAngle       = false   -- kept for UI compat (unused in new solver)
 local qb_antiOOB         = false
 local qb_autoPower       = false
-local qb_autoThrow       = false        -- NEW: auto-throw when WR in range
-local qb_autoThrowMinD   = 15          -- min dist to auto-throw
-local qb_autoThrowMaxD   = 70          -- max dist to auto-throw
-local qb_openCheck       = false        -- NEW: only throw to open receivers
-local qb_openDefDist     = 8           -- defender closer than this = covered
-local qb_powerMult       = 1.0         -- NEW: physics→game power calibration multiplier
+local qb_autoThrow       = false
+local qb_autoThrowMinD   = 15
+local qb_autoThrowMaxD   = 70
+local qb_openCheck       = false
+local qb_openDefDist     = 8
+local qb_powerMult       = 1.0
 local qb_manualAngle     = 25
 local qb_lockedTarget    = nil
 local qb_lockedPlayer    = nil
 local qb_lastAutoThrow   = 0
 
-local qb_PassMode = {
-    Dime   = {angleMin = 15, angleMax = 40},
-    Mag    = {angleMin = 18, angleMax = 45},
-    Dive   = {angleMin = 8,  angleMax = 25},
-    Jump   = {angleMin = 15, angleMax = 38},
-    Slant  = {angleMin = 5,  angleMax = 18},
-    Bullet = {angleMin = 3,  angleMax = 12},
-    Lob    = {angleMin = 40, angleMax = 60},
-    Screen = {angleMin = 3,  angleMax = 14},
-}
+local qb_Throwtypemode         = "Dime"
+local qb_throwTypes            = {"Dime","Mag","Dive","Jump","Slant","Bullet","Lob","Screen"}
+local qb_currentThrowTypeIndex = 1
+local qb_isMobile              = UserInputService.TouchEnabled
 
--- Lead in studs/second — multiplied by flight time inside solver
+-- Lead per throw type (driven by UI sliders)
 local qb_leadOverride = {
     Dime   = 1.5,
     Mag    = 2.0,
@@ -190,25 +181,15 @@ local qb_leadOverride = {
 }
 
 local qb_data = {
-    power = 0, angle = 25, airtime = 0, distance = 0,
+    power = 0, angle = 0, airtime = 0, distance = 0,
     direction = Vector3.new(), target = nil,
     targetPos = Vector3.new(),
-    wrSpeed = 0,       -- WR horizontal speed (studs/s)
-    confidence = 0,    -- 0-100 throw confidence score
-    isOpen = true,     -- whether WR is open (no defender nearby)
+    wrSpeed = 0, confidence = 0, isOpen = true,
 }
 
-local qb_Throwtypemode         = "Dime"
-local qb_throwTypes            = {"Dime","Mag","Dive","Jump","Slant","Bullet","Lob","Screen"}
-local qb_currentThrowTypeIndex = 1
-local qb_isMobile              = UserInputService.TouchEnabled
-local qb_isController          = false
-
--- ── Velocity History (per-target, 10 frames) ─────────────────────
--- FIX v26: replaces single-frame EMA — tracks velocity AND acceleration
--- so we can predict: pos + vel*t + 0.5*accel*t² instead of just pos + vel*t
-local HIST_LEN    = 10
-local qb_velHist  = {}   -- [target] = {{pos, t}, ...}
+-- ── Velocity history (for smooth prediction) ─────────────────────
+local HIST_LEN   = 10
+local qb_velHist = {}
 
 local function qb_updateHist(target, pos)
     if not qb_velHist[target] then qb_velHist[target] = {} end
@@ -217,40 +198,27 @@ local function qb_updateHist(target, pos)
     while #h > HIST_LEN do table.remove(h, 1) end
 end
 
--- Returns smoothed velocity and acceleration vectors
-local function qb_getVelAccel(target)
+-- Returns smoothed velocity from history
+local function qb_getVel(target)
     local h = qb_velHist[target]
-    if not h or #h < 2 then return Vector3.new(), Vector3.new() end
+    if not h or #h < 2 then return Vector3.new() end
     local n = #h
-
-    -- Velocity: whole-window least-squares (slope of position vs time)
-    local dtTotal = h[n].t - h[1].t
-    if dtTotal < 0.002 then return Vector3.new(), Vector3.new() end
-    local vel = (h[n].pos - h[1].pos) / dtTotal
-
-    -- Acceleration: change in velocity between first half and second half
-    local accel = Vector3.new()
-    if n >= 4 then
-        local midIdx = math.floor(n / 2)
-        local dt1 = h[n].t - h[midIdx+1].t
-        local dt2 = h[midIdx].t - h[1].t
-        if dt1 > 0.002 and dt2 > 0.002 then
-            local v1 = (h[n].pos - h[midIdx+1].pos) / dt1
-            local v2 = (h[midIdx].pos - h[1].pos) / dt2
-            local dtMid = h[midIdx+1].t - h[midIdx].t + (dtTotal * 0.5)
-            if dtMid > 0.002 then
-                accel = (v1 - v2) / dtMid
-                -- Clamp accel magnitude to avoid physics glitches corrupting prediction
-                local aMag = accel.Magnitude
-                if aMag > 40 then accel = accel.Unit * 40 end
-            end
-        end
-    end
-
-    return vel, accel
+    local dt = h[n].t - h[1].t
+    if dt < 0.002 then return Vector3.new() end
+    return (h[n].pos - h[1].pos) / dt
 end
 
--- ── OOB clamp ─────────────────────────────────────────────────────
+-- ── New prediction (from fixed_qb_aimbot.txt) ────────────────────
+-- PredictPosition: target.Position + target.Velocity * lead
+local function PredictPosition(targetHrp, lead)
+    if not targetHrp then return Vector3.new() end
+    local vel = qb_getVel(qb_data.target) -- smoothed history velocity
+    -- Clamp velocity magnitude to avoid physics glitches
+    if vel.Magnitude > 80 then vel = vel.Unit * 80 end
+    return targetHrp.Position + (vel * lead)
+end
+
+-- ── OOB clamp ────────────────────────────────────────────────────
 local function qb_clampOOB(p)
     if not qb_antiOOB then return p end
     local bb = Workspace:FindFirstChild("bbounds")
@@ -263,8 +231,7 @@ local function qb_clampOOB(p)
     )
 end
 
--- ── Receiver open check ───────────────────────────────────────────
--- NEW v26: Returns true if no opponent is within qb_openDefDist of the WR
+-- ── Open receiver check ───────────────────────────────────────────
 local function qb_isOpen(wrChar)
     if not qb_openCheck then return true end
     local hrp = wrChar:FindFirstChild("HumanoidRootPart")
@@ -283,158 +250,7 @@ local function qb_isOpen(wrChar)
     return true
 end
 
--- ── Improved throw solver ─────────────────────────────────────────
--- v26: 400-step sweep + local bisect refinement + accel-aware WR prediction
---
--- Physics: for launch speed S and flight time t
---   vH = horizontal_dist / t           (exact)
---   vV = (dy/t) + (0.5 * G * t)        (exact, upward gravity correct)
---   S  = sqrt(vH² + vV²)
---   ang = atan2(vV, vH)
---
--- WR predicted position at t (NEW: includes acceleration term):
---   wrX(t) = posX + velX*t + 0.5*accelX*t² + leadDir.X * lead * t
---   wrZ(t) = posZ + velZ*t + 0.5*accelZ*t² + leadDir.Z * lead * t
---   wrY(t) = posY + velY*t*0.15 (partial vertical, WR doesn't fly)
---
-local function qb_calcThrow(fromPos, toPos, vel, accel, useAutoAngle, modeName)
-    local cfg      = qb_PassMode[modeName] or qb_PassMode["Dime"]
-    local aMin, aMax = cfg.angleMin, cfg.angleMax
-    local aMid     = (aMin + aMax) * 0.5
-    local lead     = qb_leadOverride[modeName] or 1.5
-
-    -- WR flat speed & lead direction
-    local vFlat   = Vector3.new(vel.X, 0, vel.Z)
-    local wrSpeed = vFlat.Magnitude
-
-    local toWrFlat = Vector3.new(toPos.X - fromPos.X, 0, toPos.Z - fromPos.Z)
-    local leadDir  = wrSpeed > 0.8
-        and vFlat.Unit
-        or (toWrFlat.Magnitude > 0.1 and toWrFlat.Unit or Vector3.new())
-
-    -- Predicted WR position at flight time t (velocity + acceleration + extra lead)
-    local function wrAt(t)
-        local x = toPos.X + vel.X*t + 0.5*accel.X*t*t + leadDir.X*lead*t
-        local y = toPos.Y + vel.Y*t*0.15
-        local z = toPos.Z + vel.Z*t + 0.5*accel.Z*t*t + leadDir.Z*lead*t
-        return qb_clampOOB(Vector3.new(x, y, z))
-    end
-
-    -- Exact physics for a given flight time t
-    local function solve(t)
-        if t <= 0 then return nil end
-        local w  = wrAt(t)
-        local dx = w.X - fromPos.X
-        local dy = w.Y - fromPos.Y
-        local dz = w.Z - fromPos.Z
-        local dH = math.sqrt(dx*dx + dz*dz)
-        if dH < 0.3 then return nil end
-        local vH  = dH / t
-        local vV  = dy / t + 0.5 * G * t
-        local spd = math.sqrt(vH*vH + vV*vV)
-        local ang = math.deg(math.atan2(vV, vH))
-        return spd, ang, w
-    end
-
-    -- Local bisect refinement around a winning t
-    local function bisectRefine(tCenter, targetAng, isAutoMode)
-        local lo = math.max(0.03, tCenter - 0.08)
-        local hi = tCenter + 0.08
-        local bV, bA, bT, bW = 0, targetAng, tCenter, wrAt(tCenter)
-        local best = math.huge
-        for _ = 1, 24 do
-            local tm = (lo + hi) * 0.5
-            local s, a, w = solve(tm)
-            if s and s >= 4 and s <= 96 then
-                local sc = math.abs(a - targetAng)
-                if sc < best then
-                    best = sc; bV = math.clamp(s * qb_powerMult, 0, 95)
-                    bA = a; bT = tm; bW = w
-                end
-                if a < targetAng then lo = tm else hi = tm end
-            else
-                lo = tm
-            end
-        end
-        return bV, bA, bT, bW
-    end
-
-    local bV, bA, bT, bW = 0, aMid, 0.5, toPos
-
-    if useAutoAngle then
-        -- 400-step sweep: 0.03s → 4.03s, step 0.01s
-        local bestScore = math.huge
-        for i = 0, 400 do
-            local t = 0.03 + i * 0.010
-            local s, a, w = solve(t)
-            if s and s >= 4 and s <= 96 and a >= aMin and a <= aMax then
-                local score = math.abs(a - aMid)
-                if score < bestScore then
-                    bestScore = score
-                    bV = math.clamp(s * qb_powerMult, 0, 95)
-                    bA = a; bT = t; bW = w
-                end
-            end
-        end
-        -- Refine around best t
-        if bV > 0 then
-            bV, bA, bT, bW = bisectRefine(bT, aMid, true)
-        end
-        -- Fallback: ignore angle window
-        if bV == 0 then
-            local bestScore2 = math.huge
-            for i = 0, 400 do
-                local t = 0.03 + i * 0.010
-                local s, a, w = solve(t)
-                if s and s >= 4 and s <= 96 then
-                    local score = math.abs(a - aMid)
-                    if score < bestScore2 then
-                        bestScore2 = score
-                        bV = math.clamp(s * qb_powerMult, 0, 95)
-                        bA = a; bT = t; bW = w
-                    end
-                end
-            end
-        end
-    else
-        -- Manual angle: sweep + bisect
-        local ta = qb_manualAngle
-        local bestScore = math.huge
-        for i = 0, 400 do
-            local t = 0.03 + i * 0.010
-            local s, a, w = solve(t)
-            if s and s >= 4 and s <= 96 then
-                local score = math.abs(a - ta)
-                if score < bestScore then
-                    bestScore = score
-                    bV = math.clamp(s * qb_powerMult, 0, 95)
-                    bA = a; bT = t; bW = w
-                end
-            end
-        end
-        if bV > 0 then
-            bV, bA, bT, bW = bisectRefine(bT, ta, false)
-        end
-    end
-
-    bV = math.clamp(bV, 0, 95)
-
-    -- Confidence score: 100 when angle is exactly in window and speed is ideal
-    local angScore    = 100 - math.min(100, math.abs(bA - aMid) * 4)
-    local powerScore  = 100 - math.min(100, math.abs(bV - 50) * 1.5)
-    local conf        = math.floor((angScore * 0.6 + powerScore * 0.4))
-
-    qb_data.power      = bV
-    qb_data.angle      = bA
-    qb_data.airtime    = bT
-    qb_data.targetPos  = bW
-    qb_data.confidence = math.clamp(conf, 0, 100)
-    qb_data.distance   = math.sqrt((bW.X-fromPos.X)^2 + (bW.Z-fromPos.Z)^2)
-    return bV, bA, bT, bW
-end
-
--- ── Target scoring ─────────────────────────────────────────────────
--- v26: scores by screen distance + route detection + open bonus
+-- ── Target scoring ────────────────────────────────────────────────
 local function qb_screenDist(pos)
     local sp, onScreen = Camera:WorldToViewportPoint(pos)
     if not onScreen then return math.huge end
@@ -442,41 +258,13 @@ local function qb_screenDist(pos)
     return (Vector2.new(sp.X, sp.Y) - c).Magnitude
 end
 
-local function qb_scoreTarget(model)
-    local hrp = model:FindFirstChild("HumanoidRootPart")
-    if not hrp then return math.huge end
-
-    local screenD = qb_screenDist(hrp.Position)
-    local qhrp    = Char and Char:FindFirstChild("HumanoidRootPart")
-
-    -- WR moving away from QB (on a route) = good
-    local toWr = qhrp
-        and (hrp.Position - qhrp.Position).Unit
-        or  Vector3.new()
-    local h = qb_velHist[model]
-    local vel = Vector3.new()
-    if h and #h >= 2 then
-        local dt = h[#h].t - h[1].t
-        if dt > 0.001 then vel = (h[#h].pos - h[1].pos) / dt end
-    end
-    local flatVel   = Vector3.new(vel.X, 0, vel.Z)
-    local routeScore = flatVel.Magnitude > 2
-        and math.max(0, flatVel.Unit:Dot(toWr))
-        or  0.0
-
-    -- Open receiver bonus
-    local coveredPenalty = (qb_openCheck and not qb_isOpen(model)) and 8000 or 0
-
-    -- Lower = better
-    return screenD * 0.5 + (1 - routeScore) * 150 + coveredPenalty
-end
-
 local function qb_findBestTarget()
     local best, bestScore = nil, math.huge
     local function check(model)
         local hrp = model:FindFirstChild("HumanoidRootPart")
         if not hrp then return end
-        local s = qb_scoreTarget(model)
+        local coveredPenalty = (qb_openCheck and not qb_isOpen(model)) and 8000 or 0
+        local s = qb_screenDist(hrp.Position) + coveredPenalty
         if s < bestScore then best = model; bestScore = s end
     end
     for _, p in ipairs(Players:GetPlayers()) do
@@ -502,9 +290,8 @@ local function qb_getTarget()
             if qb_lockedTarget ~= nc then
                 qb_lockedTarget = nc
                 qb_data.target  = nc
-                qb_HL.Adornee   = nc
-                qb_HL.Enabled   = true
-                qb_velHist[nc]  = nil   -- reset history on respawn
+                if qb_HL then qb_HL.Adornee = nc; qb_HL.Enabled = true end
+                qb_velHist[nc]  = nil
             else
                 qb_data.target = qb_lockedTarget
             end
@@ -518,16 +305,12 @@ local function qb_getTarget()
     end
     local found = qb_findBestTarget()
     if found and found ~= qb_data.target then
-        qb_data.target  = found
-        qb_HL.Adornee   = found
-        qb_HL.Enabled   = true
+        qb_data.target = found
+        if qb_HL then qb_HL.Adornee = found; qb_HL.Enabled = true end
     end
 end
 
--- ── qb_lockFns defined HERE (before mobile block!) ────────────────
--- BUG FIX v26: In v25 these were defined AFTER the mobile block that
--- patches them, so _origLock/_origUnlock were nil → crash on mobile lock.
--- Moved before the mobile block so patching works correctly.
+-- ── Lock / unlock ─────────────────────────────────────────────────
 local qb_lockFns = {}
 
 function qb_lockFns.lock()
@@ -545,7 +328,6 @@ function qb_lockFns.lock()
     if qb_targetLabel and qb_targetLabel.Parent then
         qb_targetLabel.Text = "🔒 " .. name
     end
-    print("[Aethel Hub] Locked: " .. name)
 end
 
 function qb_lockFns.unlock()
@@ -564,7 +346,7 @@ qb_HL.FillColor        = Color3.fromRGB(84, 118, 241)
 qb_HL.OutlineColor     = Color3.fromRGB(255, 255, 255)
 qb_HL.FillTransparency = 0.85
 qb_HL.Enabled          = false
-pcall(function() qb_HL.Parent = CoreGui end) -- CoreGui blocked on some executors
+pcall(function() qb_HL.Parent = CoreGui end)
 
 -- ── Throw arc beam ────────────────────────────────────────────────
 local qb_a0, qb_a1, qb_beam
@@ -587,129 +369,93 @@ end)
 -- ── HUD GUI ───────────────────────────────────────────────────────
 local qb_gui = Instance.new("ScreenGui")
 qb_gui.Name           = "QBACards"
-qb_gui.Parent         = Player:WaitForChild("PlayerGui", 10)
+qb_gui.Parent         = Player:WaitForChild("PlayerGui", 10) or Player:FindFirstChild("PlayerGui")
 qb_gui.ResetOnSpawn   = false
 qb_gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 qb_gui.Enabled        = false
 qb_gui.DisplayOrder   = 10
 
-local qb_powerTitle   = nil   -- assigned below; referenced by Auto Power toggle
-local qb_targetLabel  = nil   -- assigned below; referenced by lock/unlock
+local qb_powerTitle  = nil
+local qb_targetLabel = nil
 
 local function qb_safeText(lbl, txt)
     if lbl and lbl.Parent then lbl.Text = tostring(txt) end
 end
 
--- HUD layout
-local HUD_H      = qb_isMobile and 78 or 68
-local HUD_W_SM   = qb_isMobile and 88 or 76
-local HUD_W_LG   = qb_isMobile and 150 or 130
-local HUD_W_XL   = qb_isMobile and 120 or 104   -- confidence/open card
-local HUD_GAP    = 6
-local HUD_Y_OFF  = qb_isMobile and 16 or 12
+-- ── HUD Cards ─────────────────────────────────────────────────────
+local HUD_H     = qb_isMobile and 78 or 68
+local HUD_W_SM  = qb_isMobile and 88 or 76
+local HUD_W_LG  = qb_isMobile and 150 or 130
+local HUD_W_XL  = qb_isMobile and 120 or 104
+local HUD_GAP   = 6
+local HUD_Y_OFF = qb_isMobile and 16 or 12
 
--- 6 cards: Type, Power, Airtime, Angle, Open, Target
-local ROW_TOTAL  = HUD_W_SM*4 + HUD_W_XL + HUD_W_LG + HUD_GAP*5
+local ROW_TOTAL   = HUD_W_SM*4 + HUD_W_XL + HUD_W_LG + HUD_GAP*5
 local HUD_START_X = -ROW_TOTAL / 2
 
 local function makeDragCard(gui, name, anchorX, anchorY, offX, offY,
-                            defaultTxt, titleTxt, valColor, titleColor, w, h)
-    valColor   = valColor   or Color3.fromRGB(255, 255, 255)
-    titleColor = titleColor or Color3.fromRGB(130, 160, 255)
+    defaultVal, titleTxt, valColor, titleColor, w, h)
     w = w or HUD_W_SM; h = h or HUD_H
-
-    local frame = Instance.new("Frame")
-    frame.Name             = name
-    frame.Parent           = gui
-    frame.Size             = UDim2.new(0, w, 0, h)
-    frame.AnchorPoint      = Vector2.new(anchorX, anchorY)
-    frame.Position         = UDim2.new(anchorX, offX, anchorY, offY)
-    frame.BackgroundColor3 = Color3.fromRGB(12, 12, 18)
-    frame.BorderSizePixel  = 0
-    frame.BackgroundTransparency = 0.12
-    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 12)
-
-    local stroke = Instance.new("UIStroke", frame)
-    stroke.Color = titleColor; stroke.Thickness = 1.8; stroke.Transparency = 0.55
-
-    local vLabel = Instance.new("TextLabel")
-    vLabel.Parent             = frame
-    vLabel.Size               = UDim2.new(1, -6, 0.58, 0)
-    vLabel.Position           = UDim2.new(0, 3, 0, 6)
-    vLabel.BackgroundTransparency = 1
-    vLabel.Text               = defaultTxt
-    vLabel.TextColor3         = valColor
-    vLabel.TextScaled         = false
-    vLabel.TextSize           = qb_isMobile and 22 or 20
-    vLabel.Font               = Enum.Font.GothamBold
-    vLabel.TextXAlignment     = Enum.TextXAlignment.Center
-    vLabel.TextStrokeColor3   = Color3.new(0,0,0)
-    vLabel.TextStrokeTransparency = 0.5
-
-    local div = Instance.new("Frame", frame)
-    div.Size               = UDim2.new(0.82, 0, 0, 1)
-    div.Position           = UDim2.new(0.09, 0, 0.64, 0)
-    div.BackgroundColor3   = titleColor
-    div.BackgroundTransparency = 0.7
-    div.BorderSizePixel    = 0
-
-    local tLabel = Instance.new("TextLabel")
-    tLabel.Parent             = frame
-    tLabel.Size               = UDim2.new(1, -4, 0.3, 0)
-    tLabel.Position           = UDim2.new(0, 2, 0.68, 0)
-    tLabel.BackgroundTransparency = 1
-    tLabel.Text               = titleTxt
-    tLabel.TextColor3         = titleColor
-    tLabel.TextScaled         = false
-    tLabel.TextSize           = qb_isMobile and 12 or 11
-    tLabel.Font               = Enum.Font.Gotham
-    tLabel.TextXAlignment     = Enum.TextXAlignment.Center
-
+    local F = Instance.new("Frame", gui)
+    F.Name = name
+    F.Size = UDim2.new(0, w, 0, h)
+    F.AnchorPoint = Vector2.new(anchorX, anchorY)
+    F.Position = UDim2.new(0.5, offX, 0, offY)
+    F.BackgroundColor3 = Color3.fromRGB(8, 8, 20)
+    F.BorderSizePixel = 0
+    F.Active = true
+    Instance.new("UICorner", F).CornerRadius = UDim.new(0, 8)
+    local S = Instance.new("UIStroke", F)
+    S.Color = Color3.fromRGB(60, 55, 130); S.Thickness = 1.2
+    local VL = Instance.new("TextLabel", F)
+    VL.Size = UDim2.new(1, 0, 0.55, 0); VL.Position = UDim2.new(0, 0, 0.08, 0)
+    VL.BackgroundTransparency = 1; VL.Text = tostring(defaultVal)
+    VL.TextColor3 = valColor or Color3.fromRGB(255,255,255)
+    VL.TextSize = qb_isMobile and 20 or 17; VL.Font = Enum.Font.GothamBold
+    local TL = Instance.new("TextLabel", F)
+    TL.Size = UDim2.new(1, 0, 0.35, 0); TL.Position = UDim2.new(0, 0, 0.63, 0)
+    TL.BackgroundTransparency = 1; TL.Text = titleTxt
+    TL.TextColor3 = titleColor or Color3.fromRGB(130,125,190)
+    TL.TextSize = qb_isMobile and 11 or 10; TL.Font = Enum.Font.Gotham
     -- Drag
-    local dragging, dragStart, startPos = false, nil, nil
-    frame.InputBegan:Connect(function(inp)
+    local dragging, dragStart, dragPos0 = false, nil, nil
+    F.InputBegan:Connect(function(inp)
         if inp.UserInputType == Enum.UserInputType.MouseButton1
-           or inp.UserInputType == Enum.UserInputType.Touch then
-            dragging = true; dragStart = inp.Position; startPos = frame.Position
-            inp.Changed:Connect(function()
-                if inp.UserInputState == Enum.UserInputState.End then dragging = false end
-            end)
+        or inp.UserInputType == Enum.UserInputType.Touch then
+            dragging=true; dragStart=inp.Position; dragPos0=F.Position
         end
     end)
     UserInputService.InputChanged:Connect(function(inp)
         if not dragging then return end
         if inp.UserInputType == Enum.UserInputType.MouseMovement
-           or inp.UserInputType == Enum.UserInputType.Touch then
+        or inp.UserInputType == Enum.UserInputType.Touch then
             local d = inp.Position - dragStart
-            frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
-                                       startPos.Y.Scale, startPos.Y.Offset + d.Y)
+            F.Position = UDim2.new(dragPos0.X.Scale, dragPos0.X.Offset+d.X,
+                                    dragPos0.Y.Scale, dragPos0.Y.Offset+d.Y)
         end
     end)
     UserInputService.InputEnded:Connect(function(inp)
         if inp.UserInputType == Enum.UserInputType.MouseButton1
-           or inp.UserInputType == Enum.UserInputType.Touch then dragging = false end
+        or inp.UserInputType == Enum.UserInputType.Touch then dragging=false end
     end)
-    return vLabel, tLabel
+    return VL, TL
 end
 
-local WHITE     = Color3.fromRGB(255, 255, 255)
-local COL_TYPE  = Color3.fromRGB(130, 140, 255)
-local COL_PWR   = Color3.fromRGB(100, 200, 255)
-local COL_AIR   = Color3.fromRGB(255, 200, 80)
-local COL_ANG   = Color3.fromRGB(130, 140, 255)
-local COL_CONF  = Color3.fromRGB(80, 220, 140)
-local COL_TGT   = Color3.fromRGB(130, 140, 255)
+local WHITE    = Color3.fromRGB(255, 255, 255)
+local COL_TYPE = Color3.fromRGB(130, 140, 255)
+local COL_PWR  = Color3.fromRGB(100, 200, 255)
+local COL_CONF = Color3.fromRGB(80, 220, 140)
+local COL_TGT  = Color3.fromRGB(130, 140, 255)
 
 local X = HUD_START_X
 local qb_modeLabel,    _               = makeDragCard(qb_gui,"ModeCard",    0.5,0, X,                           HUD_Y_OFF, "Dime",  "Throw Type", WHITE, COL_TYPE)
 local qb_powerLabel,   qb_powerTitle   = makeDragCard(qb_gui,"PowerCard",   0.5,0, X+(HUD_W_SM+HUD_GAP),        HUD_Y_OFF, "--",    "Power",      WHITE, COL_PWR)
-local qb_airtimeLabel, _               = makeDragCard(qb_gui,"AirtimeCard", 0.5,0, X+(HUD_W_SM+HUD_GAP)*2,      HUD_Y_OFF, "--",    "Airtime",    WHITE, COL_AIR)
-local qb_angleLabel,   _               = makeDragCard(qb_gui,"AngleCard",   0.5,0, X+(HUD_W_SM+HUD_GAP)*3,      HUD_Y_OFF, "--",    "Angle",      WHITE, COL_ANG)
+local qb_airtimeLabel, _               = makeDragCard(qb_gui,"AirtimeCard", 0.5,0, X+(HUD_W_SM+HUD_GAP)*2,      HUD_Y_OFF, "--",    "Airtime",    WHITE, Color3.fromRGB(255,200,80))
+local qb_angleLabel,   _               = makeDragCard(qb_gui,"AngleCard",   0.5,0, X+(HUD_W_SM+HUD_GAP)*3,      HUD_Y_OFF, "--",    "Lead",       WHITE, Color3.fromRGB(130,140,255))
 local qb_confLabel,    qb_openLabel    = makeDragCard(qb_gui,"ConfCard",    0.5,0, X+(HUD_W_SM+HUD_GAP)*4,      HUD_Y_OFF, "--",    "Open ✓",     COL_CONF, COL_CONF, HUD_W_XL, HUD_H)
--- qb_targetLabel is declared early (above lockFns) so lock/unlock can write to it
-qb_targetLabel                         = select(1, makeDragCard(qb_gui,"TargetCard",0.5,0, X+(HUD_W_SM+HUD_GAP)*4+HUD_W_XL+HUD_GAP, HUD_Y_OFF, "None",  "Target",     WHITE, COL_TGT, HUD_W_LG, HUD_H))
+qb_targetLabel                         = select(1, makeDragCard(qb_gui,"TargetCard",0.5,0, X+(HUD_W_SM+HUD_GAP)*4+HUD_W_XL+HUD_GAP, HUD_Y_OFF, "None",  "Target", WHITE, COL_TGT, HUD_W_LG, HUD_H))
 
--- ── Mobile buttons ────────────────────────────────────────────────
+-- ── Mobile throw buttons ──────────────────────────────────────────
 local qb_cycleBtn, qb_lockBtn
 local qb_mobileGui = nil
 
@@ -720,104 +466,29 @@ if qb_isMobile then
     qb_mobileGui.IgnoreGuiInset = true
     qb_mobileGui.DisplayOrder   = 20
     qb_mobileGui.Enabled        = false
-    qb_mobileGui.Parent         = Player:WaitForChild("PlayerGui", 10)
+    qb_mobileGui.Parent         = Player:WaitForChild("PlayerGui", 10) or Player:FindFirstChild("PlayerGui")
 
-    local PILL_W, PILL_H = 110, 44
-    local function makePill(name, offY, icon, labelTxt, bgColor)
-        local btn = Instance.new("TextButton")
-        btn.Name             = name
-        btn.Parent           = qb_mobileGui
-        btn.Size             = UDim2.new(0, PILL_W, 0, PILL_H)
-        btn.AnchorPoint      = Vector2.new(1, 1)
-        btn.Position         = UDim2.new(1, -14, 1, offY)
-        btn.BackgroundColor3 = bgColor
-        btn.BackgroundTransparency = 0.08
-        btn.BorderSizePixel  = 0
-        btn.AutoButtonColor  = false
-        btn.ZIndex           = 10
+    local function makeBtn(txt, ax, ay, px, py, w, h)
+        local btn = Instance.new("TextButton", qb_mobileGui)
+        btn.Size = UDim2.new(0, w or 64, 0, h or 64)
+        btn.AnchorPoint = Vector2.new(ax, ay)
+        btn.Position = UDim2.new(px, 0, py, 0)
+        btn.BackgroundColor3 = Color3.fromRGB(10, 10, 24)
+        btn.BorderSizePixel = 0
+        btn.Text = txt
+        btn.TextColor3 = Color3.fromRGB(200, 200, 255)
+        btn.TextSize = 20; btn.Font = Enum.Font.GothamBold
         Instance.new("UICorner", btn).CornerRadius = UDim.new(1, 0)
-
-        local stroke = Instance.new("UIStroke", btn)
-        stroke.Color = Color3.new(1,1,1); stroke.Thickness = 1.5
-        stroke.Transparency = 0.55
-        stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
-
-        local iconLbl = Instance.new("TextLabel", btn)
-        iconLbl.Size = UDim2.new(0, PILL_H, 1, 0)
-        iconLbl.Position = UDim2.new(0, 2, 0, 0)
-        iconLbl.BackgroundTransparency = 1
-        iconLbl.Text = icon; iconLbl.TextScaled = true
-        iconLbl.Font = Enum.Font.GothamBold
-        iconLbl.TextColor3 = Color3.new(1,1,1); iconLbl.ZIndex = 11
-
-        local textLbl = Instance.new("TextLabel", btn)
-        textLbl.Size = UDim2.new(1, -(PILL_H+6), 1, 0)
-        textLbl.Position = UDim2.new(0, PILL_H+2, 0, 0)
-        textLbl.BackgroundTransparency = 1
-        textLbl.Text = labelTxt; textLbl.TextScaled = true
-        textLbl.Font = Enum.Font.GothamBold
-        textLbl.TextColor3 = Color3.new(1,1,1)
-        textLbl.TextXAlignment = Enum.TextXAlignment.Left; textLbl.ZIndex = 11
-
-        btn.MouseButton1Down:Connect(function()
-            TweenService:Create(btn, TweenInfo.new(0.07), {BackgroundTransparency=0.3}):Play()
-        end)
-        btn.MouseButton1Up:Connect(function()
-            TweenService:Create(btn, TweenInfo.new(0.12), {BackgroundTransparency=0.08}):Play()
-        end)
-
-        return btn, textLbl
+        local S = Instance.new("UIStroke", btn)
+        S.Color = Color3.fromRGB(108, 99, 255); S.Thickness = 1.5
+        return btn
     end
 
-    qb_cycleBtn = makePill("CycleBtn", -185, "↻", "CYCLE", Color3.fromRGB(40,130,60))
-
-    local lockTextLbl
-    qb_lockBtn, lockTextLbl = makePill("LockBtn", -131, "🎯", "LOCK", Color3.fromRGB(170,40,40))
-
-    -- BUG FIX v26: Now qb_lockFns.lock/unlock are defined ABOVE, so this patch works correctly
-    local function refreshLockLabel()
-        if lockTextLbl then
-            lockTextLbl.Text = (qb_lockedPlayer or qb_lockedTarget) and "UNLOCK" or "LOCK"
-        end
-    end
-    local _origLock   = qb_lockFns.lock
-    local _origUnlock = qb_lockFns.unlock
-    qb_lockFns.lock = function()
-        _origLock(); refreshLockLabel()
-    end
-    qb_lockFns.unlock = function()
-        _origUnlock(); refreshLockLabel()
-    end
+    qb_cycleBtn = makeBtn("↻", 1, 1, 0.98, 0.85)
+    qb_lockBtn  = makeBtn("🎯", 1, 1, 0.98, 0.93)
 end
 
--- ── hasBall / GUI power ────────────────────────────────────────────
-local function qb_hasBall()
-    return Char ~= nil and Char:FindFirstChildOfClass("Tool") ~= nil
-end
-
-local function qb_getGuiPower()
-    local bg = Player.PlayerGui:FindFirstChild("BallGui")
-    if not bg then return nil end
-    local disp = bg:FindFirstChild("Disp", true)
-    if disp and disp:IsA("TextLabel") then
-        local n = tonumber(disp.Text)
-        if n and n > 0 then return n end
-    end
-    for _, v in ipairs(bg:GetDescendants()) do
-        if v:IsA("Frame") and v.Size.X.Scale > 0 and v.Size.X.Scale <= 1 then
-            return math.clamp(v.Size.X.Scale * 95, 1, 95)
-        end
-    end
-    for _, v in ipairs(bg:GetDescendants()) do
-        if v:IsA("TextLabel") then
-            local n = tonumber(v.Text)
-            if n and n >= 1 and n <= 95 then return n end
-        end
-    end
-    return nil
-end
-
--- ── Remote finding ─────────────────────────────────────────────────
+-- ── Remote finding ────────────────────────────────────────────────
 local function qb_findRemote(Football)
     local handle = Football:FindFirstChild("Handle")
     if handle then
@@ -833,8 +504,6 @@ local function qb_findRemote(Football)
 end
 
 -- ── Core throw execution ──────────────────────────────────────────
--- v26: uses HANDLE position (not head) for both HUD and throw — eliminates
--- the arc mismatch that caused underthrown passes in v25.
 local function qb_doThrow(origin, targetPos, power)
     local Football = Char and Char:FindFirstChildOfClass("Tool")
     if not Football then return false end
@@ -846,7 +515,9 @@ local function qb_doThrow(origin, targetPos, power)
     return true
 end
 
-local function qb_executeThrow()
+-- ── ThrowBall (new simplified solver) ────────────────────────────
+-- Uses PredictPosition with per-throw-type lead, then fires the remote.
+local function ThrowBall()
     if not qbEnabled then return end
     local Football = Char and Char:FindFirstChildOfClass("Tool")
     if not Football then return end
@@ -859,23 +530,36 @@ local function qb_executeThrow()
     local hrp = qb_data.target:FindFirstChild("HumanoidRootPart")
     if not hrp then return end
 
-    local vel, accel = qb_getVelAccel(qb_data.target)
+    -- Lead from current throw type slider
+    local lead = qb_leadOverride[qb_Throwtypemode] or 1.5
 
-    -- Solve from handle (consistent with HUD computation)
-    local power, angle, airtime, predicted =
-        qb_calcThrow(handle.Position, hrp.Position, vel, accel, qb_autoAngle, qb_Throwtypemode)
+    -- Predict where the WR will be
+    local predicted = qb_clampOOB(PredictPosition(hrp, lead))
 
-    if power <= 0 or airtime <= 0 then return end
+    -- Calculate throw direction and power
+    local origin   = handle.Position
+    local disp     = predicted - origin
+    local dist     = disp.Magnitude
+    if dist < 1 then return end
 
-    local sendPower = power
+    -- Power: scale with distance, clamp 10-95, apply multiplier
+    local rawPower = math.clamp(dist * 1.6, 10, 95) * qb_powerMult
+    local power    = math.clamp(rawPower, 0, 95)
 
-    -- Exact v0 direction: displacement + upward gravity arc
-    local disp = predicted - handle.Position
-    local v0   = Vector3.new(disp.X, disp.Y + 0.5 * G * airtime * airtime, disp.Z)
-    if v0.Magnitude < 0.1 then return end
+    -- Aim point: fire toward predicted position
+    local aimPoint = predicted
 
-    local aimPoint = handle.Position + v0.Unit * 5000
-    qb_doThrow(handle.Position, aimPoint, sendPower)
+    -- Update HUD
+    qb_data.power     = power
+    qb_data.targetPos = predicted
+    qb_data.distance  = dist
+    qb_data.airtime   = lead
+    qb_data.confidence = math.clamp(100 - math.abs(power - 50), 0, 100)
+    qb_safeText(qb_powerLabel, math.floor(power))
+    qb_safeText(qb_airtimeLabel, string.format("%.1f", lead))
+    qb_safeText(qb_angleLabel, string.format("%.1f", lead))
+
+    qb_doThrow(origin, aimPoint, power)
 end
 
 -- ── Throw type cycle ──────────────────────────────────────────────
@@ -891,177 +575,124 @@ local function qb_cycleThrowType(reverse)
     qb_safeText(qb_modeLabel, qb_Throwtypemode)
 end
 
--- ── RenderStepped: tracking, HUD, beam, auto-throw ────────────────
+-- ── RenderStepped: tracking + HUD update ─────────────────────────
 RunService.RenderStepped:Connect(function(dt)
     if not qbEnabled then
-        qb_beam.Enabled = false; qb_HL.Enabled = false; qb_gui.Enabled = false
+        if qb_beam then qb_beam.Enabled = false end
+        if qb_HL then qb_HL.Enabled = false end
+        if qb_gui then qb_gui.Enabled = false end
         if qb_mobileGui then qb_mobileGui.Enabled = false end
         return
     end
+
+    qb_gui.Enabled = true
     if qb_mobileGui then qb_mobileGui.Enabled = true end
 
-    local hasBall = qb_hasBall()
-    if not hasBall then
-        qb_beam.Enabled = false; qb_HL.Enabled = false; qb_gui.Enabled = false
-        qb_data.target = nil
-        return
-    end
-    qb_gui.Enabled = true
-
-    qb_getTarget()
-
-    if not qb_data.target or not qb_data.target.Parent then
-        qb_HL.Enabled = false; qb_beam.Enabled = false
-        qb_safeText(qb_targetLabel, "None")
-        qb_safeText(qb_angleLabel,   "--")
-        qb_safeText(qb_powerLabel,   "--")
-        qb_safeText(qb_airtimeLabel, "--")
-        qb_safeText(qb_confLabel,    "--")
-        qb_safeText(qb_modeLabel,    qb_Throwtypemode)
-        return
-    end
-
-    qb_HL.Adornee = qb_data.target
-    qb_HL.Enabled = true
-
-    local Football = Char and Char:FindFirstChildOfClass("Tool")
-    local handle   = Football and Football:FindFirstChild("Handle")
-    if not handle then return end
-
-    local hrp  = qb_data.target:FindFirstChild("HumanoidRootPart")
-    local tPos = hrp and hrp.Position or qb_data.target:GetPivot().Position
-
-    -- Update per-target velocity history
-    qb_updateHist(qb_data.target, tPos)
-    local vel, accel = qb_getVelAccel(qb_data.target)
-
-    -- WR speed for HUD
-    local wrSpeed = Vector3.new(vel.X, 0, vel.Z).Magnitude
-    qb_data.wrSpeed = wrSpeed
-
-    -- Open check
-    local isOpen = qb_isOpen(qb_data.target)
-    qb_data.isOpen = isOpen
-
-    -- Compute throw params (from handle, consistent with execute)
-    local calcV, angle, airtime, predicted =
-        qb_calcThrow(handle.Position, tPos, vel, accel, qb_autoAngle, qb_Throwtypemode)
-
-    qb_data.power   = calcV
-    qb_data.angle   = angle
-    qb_data.airtime = airtime
-
-    -- HUD labels
-    local tName = "None"
-    local tPlr  = Players:GetPlayerFromCharacter(qb_data.target)
-    if tPlr then tName = tPlr.DisplayName ~= "" and tPlr.DisplayName or tPlr.Name end
-    if qb_lockedPlayer or qb_lockedTarget then tName = "🔒 " .. tName end
-
-    local dispPow
-    if qb_autoPower then
-        dispPow = string.format("%d", math.floor(calcV + 0.5))
-    else
-        local guiP = qb_getGuiPower()
-        dispPow = guiP and string.format("%d", math.floor(guiP + 0.5))
-                       or  string.format("%d", math.floor(calcV + 0.5))
-    end
-
-    qb_safeText(qb_modeLabel,    qb_Throwtypemode)
-    qb_safeText(qb_powerLabel,   dispPow)
-    qb_safeText(qb_airtimeLabel, string.format("%.2fs", airtime))
-    qb_safeText(qb_angleLabel,   string.format("%.1f°", angle))
-    qb_safeText(qb_targetLabel,  tName)
-
-    -- Confidence / open indicator
-    local confStr = string.format("%d%%", qb_data.confidence)
-    qb_safeText(qb_confLabel, confStr)
-    if qb_openLabel and qb_openLabel.Parent then
-        if isOpen then
-            qb_openLabel.Text      = "Open ✓"
-            qb_confLabel.TextColor3 = Color3.fromRGB(80, 220, 140)
-        else
-            qb_openLabel.Text      = "Covered ✗"
-            qb_confLabel.TextColor3 = Color3.fromRGB(255, 90, 80)
+    -- Update velocity history for all teammates
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= Player and p.Team == Player.Team and p.Character then
+            local h = p.Character:FindFirstChild("HumanoidRootPart")
+            if h then qb_updateHist(p.Character, h.Position) end
         end
     end
 
-    -- Power title update
+    -- Get best target
+    qb_getTarget()
+
+    local target = qb_data.target
+    if not target or not target.Parent then
+        if qb_HL then qb_HL.Enabled = false end
+        if qb_beam then qb_beam.Enabled = false end
+        qb_safeText(qb_targetLabel, "None")
+        return
+    end
+
+    local hrp = target:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    -- Update HUD target name
+    local tPlr = Players:GetPlayerFromCharacter(target)
+    local name = tPlr and (tPlr.DisplayName ~= "" and tPlr.DisplayName or tPlr.Name) or target.Name
+    qb_safeText(qb_targetLabel, name)
+    qb_safeText(qb_modeLabel, qb_Throwtypemode)
+
+    -- Open/covered label
+    local isOpen = qb_isOpen(target)
+    qb_data.isOpen = isOpen
+    if qb_openLabel and qb_openLabel.Parent then
+        qb_openLabel.Text = isOpen and "Open ✓" or "Covered"
+        qb_confLabel.TextColor3 = isOpen
+            and Color3.fromRGB(80, 210, 120)
+            or  Color3.fromRGB(255, 100, 80)
+    end
+
+    -- Beam from QB handle to predicted target position
+    local Football = Char and Char:FindFirstChildOfClass("Tool")
+    local handle = Football and Football:FindFirstChild("Handle")
+    if handle and qb_a0 and qb_a1 and qb_beam then
+        local lead = qb_leadOverride[qb_Throwtypemode] or 1.5
+        local predicted = qb_clampOOB(PredictPosition(hrp, lead))
+        qb_a0.WorldPosition = handle.Position
+        qb_a1.WorldPosition = predicted
+        qb_beam.Enabled = true
+    end
+
+    -- Auto Power toggle label
     if qb_powerTitle and qb_powerTitle.Parent then
         qb_powerTitle.Text = qb_autoPower and "Power (AUTO)" or "Power (BAR)"
     end
 
-    -- Arc beam (computed from handle — matches actual throw)
-    if airtime > 0 and calcV > 0 then
-        local disp = predicted - handle.Position
-        if disp.Magnitude > 0.5 then
-            local v0 = Vector3.new(disp.X, disp.Y + 0.5 * G * airtime * airtime, disp.Z)
-            if v0.Magnitude > 0.01 then
-                local gv = Vector3.new(0, -G, 0)
-                local c0, c1, cf1, cf2 = beamProjectile(gv, v0.Unit * calcV, handle.Position, airtime)
-                qb_beam.Enabled    = true
-                qb_beam.CurveSize0 = c0 or 0
-                qb_beam.CurveSize1 = c1 or 0
-                qb_a0.CFrame = qb_a0.Parent.CFrame:Inverse() * (cf1 or CFrame.new(handle.Position))
-                qb_a1.CFrame = qb_a1.Parent.CFrame:Inverse() * (cf2 or CFrame.new(predicted))
+    -- Auto-throw
+    if qb_autoThrow then
+        local qhrp = Char and Char:FindFirstChild("HumanoidRootPart")
+        if qhrp then
+            local d = (hrp.Position - qhrp.Position).Magnitude
+            if d >= qb_autoThrowMinD and d <= qb_autoThrowMaxD then
+                local now = tick()
+                if now - qb_lastAutoThrow > 0.8 then
+                    qb_lastAutoThrow = now
+                    ThrowBall()
+                end
             end
-        end
-    else
-        qb_beam.Enabled = false
-    end
-
-    -- Auto-throw: fires when WR is in range, solution is valid, and receiver is open (if check enabled)
-    if qb_autoThrow and calcV > 0 and airtime > 0 then
-        local dist = qb_data.distance
-        local now  = tick()
-        local openOk = not qb_openCheck or isOpen
-        if dist >= qb_autoThrowMinD and dist <= qb_autoThrowMaxD
-           and openOk
-           and now - qb_lastAutoThrow > 0.3 then
-            qb_lastAutoThrow = now
-            task.spawn(qb_executeThrow)
         end
     end
 end)
 
--- ── Input ─────────────────────────────────────────────────────────
-local qb_tapCD = false
-local function qb_tryThrow()
-    if not qbEnabled or qb_tapCD then return end
-    qb_tapCD = true
-    qb_executeThrow()
-    task.delay(0.18, function() qb_tapCD = false end)
-end
-
-UserInputService.InputBegan:Connect(function(inp, gpe)
-    if not qbEnabled then return end
-    local kc = inp.KeyCode
-    local ut = inp.UserInputType
-
-    if ut == Enum.UserInputType.Touch then qb_tryThrow(); return end
-    if ut == Enum.UserInputType.MouseButton1 and not gpe then qb_tryThrow(); return end
-    if gpe then return end
-
-    if kc == Enum.KeyCode.Space or kc == Enum.KeyCode.E then qb_tryThrow() end
-    if kc == Enum.KeyCode.Q or kc == Enum.KeyCode.Z  then qb_cycleThrowType(false) end
-    if kc == Enum.KeyCode.Tab or kc == Enum.KeyCode.X then qb_cycleThrowType(true) end
-    if kc == Enum.KeyCode.G then
+-- ── Input: throw on E / Space / M1 / touch ───────────────────────
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed or not qbEnabled then return end
+    -- PC keyboard / mouse
+    if input.KeyCode == Enum.KeyCode.E
+    or input.KeyCode == Enum.KeyCode.Space
+    or input.UserInputType == Enum.UserInputType.MouseButton1 then
+        ThrowBall()
+    end
+    -- Cycle throw type
+    if input.KeyCode == Enum.KeyCode.Q then qb_cycleThrowType(false) end
+    if input.KeyCode == Enum.KeyCode.Tab then qb_cycleThrowType(true) end
+    -- Lock / unlock
+    if input.KeyCode == Enum.KeyCode.G then
         if qb_lockedPlayer or qb_lockedTarget then qb_unlockTarget()
         else qb_lockCurrentTarget() end
     end
-
-    if ut == Enum.UserInputType.Gamepad1 then
-        qb_isController = true
-        if kc == Enum.KeyCode.ButtonR1 or kc == Enum.KeyCode.ButtonR2 then qb_tryThrow() end
-        if kc == Enum.KeyCode.ButtonL1 then qb_cycleThrowType(true) end
-        if kc == Enum.KeyCode.ButtonL2 then qb_cycleThrowType(false) end
-        if kc == Enum.KeyCode.ButtonB then
-            if qb_lockedPlayer or qb_lockedTarget then qb_unlockTarget()
-            else qb_lockCurrentTarget() end
-        end
+    -- Controller
+    if input.KeyCode == Enum.KeyCode.ButtonR2 then ThrowBall() end
+    if input.KeyCode == Enum.KeyCode.ButtonR1 then qb_cycleThrowType(false) end
+    if input.KeyCode == Enum.KeyCode.ButtonL1 then qb_cycleThrowType(true) end
+    if input.KeyCode == Enum.KeyCode.ButtonB then
+        if qb_lockedPlayer or qb_lockedTarget then qb_unlockTarget()
+        else qb_lockCurrentTarget() end
     end
 end)
 
+-- Mobile touch = throw (from fixed_qb_aimbot.txt)
 if qb_isMobile then
+    UserInputService.InputBegan:Connect(function(input, gameProcessed)
+        if gameProcessed or not qbEnabled then return end
+        if input.UserInputType == Enum.UserInputType.Touch then
+            ThrowBall()
+        end
+    end)
     if qb_cycleBtn then
         qb_cycleBtn.Activated:Connect(function() qb_cycleThrowType(false) end)
     end
@@ -1072,6 +703,7 @@ if qb_isMobile then
         end)
     end
 end
+
 
 
 -- ================================================================
